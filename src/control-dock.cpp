@@ -684,7 +684,7 @@ void ControlDock::buildUi()
     deleteAction_ = toolbar_->addAction(QIcon(QStringLiteral(":/res/images/trash.svg")),
                                         QStringLiteral("Delete selected control"));
     toolbar_->addSeparator();
-    settingsAction_ = toolbar_->addAction(QIcon(QStringLiteral(":/res/images/cogs.svg")),
+    settingsAction_ = toolbar_->addAction(QIcon(QStringLiteral(":/settings/images/settings/general.svg")),
                                           QStringLiteral("Control properties"));
     toolbar_->addSeparator();
     upAction_ = toolbar_->addAction(QIcon(QStringLiteral(":/res/images/up.svg")),
