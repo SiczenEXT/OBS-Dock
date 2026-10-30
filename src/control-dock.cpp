@@ -15,6 +15,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QFrame>
 #include <QIcon>
 #include <QItemSelectionModel>
 #include <QJsonArray>
