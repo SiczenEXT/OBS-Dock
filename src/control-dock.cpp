@@ -7,16 +7,16 @@
 #include <obs-module.h>
 
 #include <QAbstractItemView>
+#include <QAction>
 #include <QByteArray>
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
-#include <QEvent>
 #include <QFile>
 #include <QFileInfo>
-#include <QFont>
 #include <QFormLayout>
-#include <QHBoxLayout>
+#include <QIcon>
+#include <QItemSelectionModel>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QKeyCombination>
@@ -29,13 +29,14 @@
 #include <QMouseEvent>
 #include <QSaveFile>
 #include <QStackedWidget>
-#include <QStyle>
 #include <QTimer>
-#include <QToolButton>
+#include <QToolBar>
 #include <QVBoxLayout>
 #include <QDir>
 
 #include <algorithm>
+#include <functional>
+#include <utility>
 
 namespace {
 
@@ -179,6 +180,75 @@ QString actionLabel(const QString &key)
     if (key == QLatin1String("obs_transition")) return QStringLiteral("OBS: Transition preview to program");
     return QStringLiteral("Unknown action");
 }
+
+class ControlListWidget final : public QListWidget {
+public:
+    using ExecuteCallback = std::function<void(int)>;
+
+    explicit ControlListWidget(ExecuteCallback execute, QWidget *parent = nullptr)
+        : QListWidget(parent), execute_(std::move(execute))
+    {
+        setMouseTracking(true);
+    }
+
+protected:
+    void mousePressEvent(QMouseEvent *event) override
+    {
+        const QPoint position = event->position().toPoint();
+
+        if (event->button() == Qt::RightButton) {
+            if (QListWidgetItem *item = itemAt(position)) {
+                setCurrentItem(item, QItemSelectionModel::ClearAndSelect);
+                setFocus(Qt::MouseFocusReason);
+            }
+            event->accept();
+            return;
+        }
+
+        if (event->button() == Qt::LeftButton) {
+            pressedItem_ = itemAt(position);
+            event->accept();
+            return;
+        }
+
+        QListWidget::mousePressEvent(event);
+    }
+
+    void mouseReleaseEvent(QMouseEvent *event) override
+    {
+        if (event->button() == Qt::LeftButton) {
+            QListWidgetItem *releasedItem = itemAt(event->position().toPoint());
+            if (pressedItem_ && releasedItem == pressedItem_ && execute_) {
+                const int clickedRow = row(pressedItem_);
+                if (clickedRow >= 0)
+                    execute_(clickedRow);
+            }
+            pressedItem_ = nullptr;
+            event->accept();
+            return;
+        }
+
+        if (event->button() == Qt::RightButton) {
+            event->accept();
+            return;
+        }
+
+        QListWidget::mouseReleaseEvent(event);
+    }
+
+    void mouseDoubleClickEvent(QMouseEvent *event) override
+    {
+        if (event->button() == Qt::LeftButton) {
+            event->accept();
+            return;
+        }
+        QListWidget::mouseDoubleClickEvent(event);
+    }
+
+private:
+    ExecuteCallback execute_;
+    QListWidgetItem *pressedItem_ = nullptr;
+};
 
 class ControlEditor final : public QDialog {
 public:
@@ -589,74 +659,65 @@ ControlDock::~ControlDock()
 void ControlDock::buildUi()
 {
     auto *root = new QVBoxLayout(this);
-    root->setContentsMargins(6, 6, 6, 6);
-    root->setSpacing(4);
+    root->setContentsMargins(0, 0, 0, 0);
+    root->setSpacing(0);
 
-    list_ = new QListWidget(this);
+    list_ = new ControlListWidget([this](int row) { executeControl(row); }, this);
     list_->setObjectName(QStringLiteral("ControlDockList"));
     list_->setSelectionMode(QAbstractItemView::SingleSelection);
     list_->setAlternatingRowColors(false);
+    list_->setFrameShape(QFrame::NoFrame);
     list_->setToolTip(QStringLiteral("Left-click a control to run it. Right-click a control to select it."));
-    list_->viewport()->installEventFilter(this);
     root->addWidget(list_, 1);
 
-    auto *toolbar = new QHBoxLayout();
-    toolbar->setContentsMargins(0, 0, 0, 0);
-    toolbar->setSpacing(2);
+    // Match OBS's native Scene/Source dock toolbar: QToolBar, 16px icons,
+    // non-floating, and icons from OBS's own active-theme Qt resources.
+    toolbar_ = new QToolBar(this);
+    toolbar_->setObjectName(QStringLiteral("controlDockToolbar"));
+    toolbar_->setMovable(false);
+    toolbar_->setFloatable(false);
+    toolbar_->setIconSize(QSize(16, 16));
+    toolbar_->setToolButtonStyle(Qt::ToolButtonIconOnly);
 
-    const auto makeButton = [this](const QString &name, const QString &tip) {
-        auto *button = new QToolButton(this);
-        button->setObjectName(name);
-        button->setAutoRaise(true);
-        button->setToolTip(tip);
-        button->setFocusPolicy(Qt::NoFocus);
-        button->setIconSize(QSize(16, 16));
-        button->setFixedSize(26, 24);
-        return button;
-    };
+    addAction_ = toolbar_->addAction(QIcon(QStringLiteral(":/res/images/plus.svg")),
+                                     QStringLiteral("Add control"));
+    deleteAction_ = toolbar_->addAction(QIcon(QStringLiteral(":/res/images/trash.svg")),
+                                        QStringLiteral("Delete selected control"));
+    toolbar_->addSeparator();
+    settingsAction_ = toolbar_->addAction(QIcon(QStringLiteral(":/res/images/cogs.svg")),
+                                          QStringLiteral("Control properties"));
+    toolbar_->addSeparator();
+    upAction_ = toolbar_->addAction(QIcon(QStringLiteral(":/res/images/up.svg")),
+                                    QStringLiteral("Move selected control up"));
+    downAction_ = toolbar_->addAction(QIcon(QStringLiteral(":/res/images/down.svg")),
+                                      QStringLiteral("Move selected control down"));
 
-    addButton_ = makeButton(QStringLiteral("addControlButton"), QStringLiteral("Add control"));
-    addButton_->setText(QStringLiteral("+"));
-    addButton_->setFont(QFont(addButton_->font().family(), addButton_->font().pointSize() + 2, QFont::Bold));
+    addAction_->setObjectName(QStringLiteral("addControlAction"));
+    deleteAction_->setObjectName(QStringLiteral("deleteControlAction"));
+    settingsAction_->setObjectName(QStringLiteral("controlPropertiesAction"));
+    upAction_->setObjectName(QStringLiteral("moveControlUpAction"));
+    downAction_->setObjectName(QStringLiteral("moveControlDownAction"));
 
-    deleteButton_ = makeButton(QStringLiteral("deleteControlButton"), QStringLiteral("Delete selected control"));
-    deleteButton_->setIcon(style()->standardIcon(QStyle::SP_TrashIcon));
+    root->addWidget(toolbar_);
 
-    settingsButton_ = makeButton(QStringLiteral("controlPropertiesButton"), QStringLiteral("Control properties"));
-    settingsButton_->setText(QStringLiteral("⚙"));
-
-    upButton_ = makeButton(QStringLiteral("moveControlUpButton"), QStringLiteral("Move selected control up"));
-    upButton_->setIcon(style()->standardIcon(QStyle::SP_ArrowUp));
-
-    downButton_ = makeButton(QStringLiteral("moveControlDownButton"), QStringLiteral("Move selected control down"));
-    downButton_->setIcon(style()->standardIcon(QStyle::SP_ArrowDown));
-
-    toolbar->addWidget(addButton_);
-    toolbar->addWidget(deleteButton_);
-    toolbar->addWidget(settingsButton_);
-    toolbar->addWidget(upButton_);
-    toolbar->addWidget(downButton_);
-    toolbar->addStretch(1);
-    root->addLayout(toolbar);
-
-    connect(addButton_, &QToolButton::clicked, this, [this]() { addControl(); });
-    connect(deleteButton_, &QToolButton::clicked, this, [this]() { deleteSelectedControl(); });
-    connect(settingsButton_, &QToolButton::clicked, this, [this]() { editSelectedControl(); });
-    connect(upButton_, &QToolButton::clicked, this, [this]() { moveSelectedControl(-1); });
-    connect(downButton_, &QToolButton::clicked, this, [this]() { moveSelectedControl(1); });
+    connect(addAction_, &QAction::triggered, this, [this]() { addControl(); });
+    connect(deleteAction_, &QAction::triggered, this, [this]() { deleteSelectedControl(); });
+    connect(settingsAction_, &QAction::triggered, this, [this]() { editSelectedControl(); });
+    connect(upAction_, &QAction::triggered, this, [this]() { moveSelectedControl(-1); });
+    connect(downAction_, &QAction::triggered, this, [this]() { moveSelectedControl(1); });
 
     connect(list_, &QListWidget::currentRowChanged, this, [this](int row) {
         const bool valid = row >= 0 && row < controls_.size();
-        deleteButton_->setEnabled(valid);
-        settingsButton_->setEnabled(valid);
-        upButton_->setEnabled(valid && row > 0);
-        downButton_->setEnabled(valid && row + 1 < controls_.size());
+        deleteAction_->setEnabled(valid);
+        settingsAction_->setEnabled(valid);
+        upAction_->setEnabled(valid && row > 0);
+        downAction_->setEnabled(valid && row + 1 < controls_.size());
     });
 
-    deleteButton_->setEnabled(false);
-    settingsButton_->setEnabled(false);
-    upButton_->setEnabled(false);
-    downButton_->setEnabled(false);
+    deleteAction_->setEnabled(false);
+    settingsAction_->setEnabled(false);
+    upAction_->setEnabled(false);
+    downAction_->setEnabled(false);
 }
 
 void ControlDock::loadControls()
@@ -804,19 +865,4 @@ void ControlDock::executeControl(int row)
         executeAutomatic(control);
 }
 
-bool ControlDock::eventFilter(QObject *watched, QEvent *event)
-{
-    if (watched == list_->viewport() && event->type() == QEvent::MouseButtonPress) {
-        auto *mouse = static_cast<QMouseEvent *>(event);
-        const QModelIndex index = list_->indexAt(mouse->position().toPoint());
-        if (mouse->button() == Qt::RightButton && index.isValid()) {
-            list_->setCurrentRow(index.row());
-            return true;
-        }
-        if (mouse->button() == Qt::LeftButton && index.isValid()) {
-            executeControl(index.row());
-            return true;
-        }
-    }
-    return QWidget::eventFilter(watched, event);
-}
+
