@@ -1,0 +1,107 @@
+name: Build OBS Control Dock (Windows)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: obs-control-dock-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    name: Build Windows x64 DLL
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out Control Dock
+        uses: actions/checkout@v4
+
+      - name: Check out pinned OBS plugin build helpers
+        uses: actions/checkout@v4
+        with:
+          repository: obsproject/obs-plugintemplate
+          ref: 3e7d7ac3b5342cd7d9b88890b9c70b472d1520fc
+          path: .obs-plugintemplate
+
+      - name: Prepare CMake helper files
+        run: |
+          Copy-Item -Path .\.obs-plugintemplate\cmake -Destination .\cmake -Recurse -Force
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { throw 'CMake is not available.' }
+
+      - name: Configure OBS 33 SDK
+        run: cmake --preset windows-x64
+
+      - name: Compile plugin DLL
+        run: cmake --build --preset windows-x64 --config Release --parallel
+
+      - name: Assemble OBS 33 plugin folder
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $PWD 'release'
+          $plugin = Join-Path $output 'obs-control-dock'
+          $data = Join-Path $plugin 'data'
+          New-Item -ItemType Directory -Force -Path $data | Out-Null
+
+          $builtDll = Join-Path $PWD 'build_x64\rundir\Release\obs-control-dock.dll'
+          if (-not (Test-Path $builtDll)) {
+            throw "Build completed without the expected DLL: $builtDll"
+          }
+          Copy-Item $builtDll $plugin
+          Copy-Item '.\data\*' $data -Recurse -Force
+
+          @'
+          OBS Control Dock 0.1.0
+
+          Installation for OBS Studio 33 (Windows x64):
+          1. Close OBS Studio.
+          2. Extract the obs-control-dock folder into:
+             C:\ProgramData\obs-studio\plugins\
+             (For portable OBS, use <OBS folder>\plugins\ instead.)
+          3. The final files must be:
+             plugins\obs-control-dock\obs-control-dock.dll
+             plugins\obs-control-dock\data\locale\en-US.ini
+          4. Start OBS and open Docks > Control Dock.
+          '@ | Set-Content -Encoding UTF8 (Join-Path $plugin 'INSTALL.txt')
+
+          $zip = Join-Path $output 'obs-control-dock-windows-x64.zip'
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path $plugin -DestinationPath $zip -CompressionLevel Optimal
+          Get-Item $zip, (Join-Path $plugin 'obs-control-dock.dll') | Format-Table FullName, Length
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: obs-control-dock-windows-x64
+          path: |
+            release/obs-control-dock-windows-x64.zip
+            release/obs-control-dock/obs-control-dock.dll
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = 'v0.1.0'
+          $zip = 'release/obs-control-dock-windows-x64.zip'
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $zip --clobber
+          } else {
+            $releaseArgs = @(
+              'release', 'create', $tag, $zip,
+              '--title', 'OBS Control Dock v0.1.0 (Windows x64)',
+              '--notes', 'Windows x64 plugin for OBS Studio 33. Extract the obs-control-dock folder into the OBS plugins folder. See INSTALL.txt in the archive.',
+              '--target', $env:GITHUB_SHA
+            )
+            gh @releaseArgs
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Could not publish the GitHub release asset.' }
